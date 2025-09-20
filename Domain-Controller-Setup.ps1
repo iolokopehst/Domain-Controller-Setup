@@ -1,16 +1,19 @@
 <#
 .SYNOPSIS
-    Automates installation of Active Directory Domain Services and promotes server to Domain Controller.
+    Fully automated Windows Server AD DS setup script.
 .DESCRIPTION
-    - Renames computer
-    - Sets static IP and DNS
-    - Installs AD DS + DNS
+    - Checks if static IP exists; prompts only if needed
+    - Checks if AD DS is installed; installs if missing
+    - Renames computer if necessary
+    - Handles automatic reboot
     - Promotes server to Domain Controller
-    - Includes error handling and keeps window open for review
+    - Error handling and pause for review
+.NOTES
+    Run as Administrator on a fresh or partially configured Windows Server.
 #>
 
 # ----------------------------
-# Ensure script is run as Administrator
+# Admin Check
 # ----------------------------
 if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
     Write-Warning "This script must be run as Administrator. Right-click PowerShell and select 'Run as Administrator'. Exiting..."
@@ -19,89 +22,152 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 }
 
 # ----------------------------
-# Prompt for Input
+# Marker file to handle reboot/resume
+# ----------------------------
+$MarkerPath = "C:\Temp\DC-Promotion-Phase2.txt"
+
+# ----------------------------
+# Resume after reboot
+# ----------------------------
+if (Test-Path $MarkerPath) {
+    Write-Host "`nResuming Domain Controller promotion after reboot..."
+    Remove-Item $MarkerPath -Force
+
+    try {
+        # Install AD DS if not already installed
+        if (-not (Get-WindowsFeature AD-Domain-Services).Installed) {
+            Write-Host "Installing AD DS role..."
+            Install-WindowsFeature AD-Domain-Services -IncludeManagementTools -ErrorAction Stop
+        }
+
+        Write-Host "Promoting server to Domain Controller..."
+        Install-ADDSForest `
+            -DomainName $DomainName `
+            -CreateDnsDelegation:$false `
+            -DatabasePath "C:\Windows\NTDS" `
+            -DomainMode "WinThreshold" `
+            -ForestMode "WinThreshold" `
+            -InstallDns:$true `
+            -LogPath "C:\Windows\NTDS" `
+            -SysvolPath "C:\Windows\SYSVOL" `
+            -SafeModeAdministratorPassword $SafeModePass `
+            -Force -ErrorAction Stop
+
+        Write-Host "`nDomain Controller promotion completed successfully!"
+    }
+    catch {
+        Write-Error "Error during DC promotion: $_"
+    }
+
+    Write-Host "`nPress any key to exit..."
+    $null = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit
+}
+
+# ----------------------------
+# Phase 1: Prompt for Input
 # ----------------------------
 $NewName      = Read-Host "Enter new computer name"
-$IPAddress    = Read-Host "Enter static IP address (e.g., 192.168.1.10)"
-$PrefixLength = Read-Host "Enter prefix length (e.g., 24 for /24)"
-$Gateway      = Read-Host "Enter default gateway (e.g., 192.168.1.1)"
-$DNSServer    = Read-Host "Enter DNS server (use same as this DC, e.g., $IPAddress)"
 $DomainName   = Read-Host "Enter new domain name (e.g., corp.local)"
 $SafeModePass = Read-Host "Enter DSRM Safe Mode password" -AsSecureString
 
-Write-Host "`n--- Starting Configuration ---`n"
-
 # ----------------------------
-# Rename Computer
+# Phase 1: Rename Computer (if needed)
 # ----------------------------
-try {
-    Rename-Computer -NewName $NewName -Force -ErrorAction Stop
-    Write-Host "Computer renamed to $NewName (changes apply after reboot)."
-}
-catch {
-    Write-Error "Failed to rename computer: $_"
-}
-
-# ----------------------------
-# Configure Static IP
-# ----------------------------
-try {
-    $NIC = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
-    if (-not $NIC) { throw "No active network adapter found." }
-
-    # Remove existing IPs
-    Get-NetIPAddress -InterfaceIndex $NIC.ifIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
-
-    # Assign new IP
-    New-NetIPAddress -InterfaceIndex $NIC.ifIndex -IPAddress $IPAddress -PrefixLength $PrefixLength -DefaultGateway $Gateway -ErrorAction Stop
-
-    # Set DNS
-    Set-DnsClientServerAddress -InterfaceIndex $NIC.ifIndex -ServerAddresses $DNSServer -ErrorAction Stop
-
-    Write-Host "Static IP and DNS configured."
-}
-catch {
-    Write-Error "Failed to configure network settings: $_"
+$currentName = $env:COMPUTERNAME
+if ($currentName -ne $NewName) {
+    try {
+        Rename-Computer -NewName $NewName -Force -ErrorAction Stop
+        Write-Host "Computer renamed to $NewName."
+        $RenameRebootRequired = $true
+    }
+    catch {
+        Write-Error "Failed to rename computer: $_"
+    }
+} else {
+    Write-Host "Computer name is already $NewName. Skipping rename."
+    $RenameRebootRequired = $false
 }
 
 # ----------------------------
-# Install AD DS Role
+# Phase 1: Configure Static IP if missing
 # ----------------------------
-try {
-    Install-WindowsFeature AD-Domain-Services -IncludeManagementTools -ErrorAction Stop
-    Write-Host "AD DS role installed."
-}
-catch {
-    Write-Error "Failed to install AD DS role: $_"
+$NIC = Get-NetAdapter | Where-Object { $_.Status -eq "Up" } | Select-Object -First 1
+$HasStaticIP = (Get-NetIPAddress -InterfaceIndex $NIC.ifIndex -AddressFamily IPv4 | Where-Object { $_.PrefixOrigin -eq "Manual" })
+
+if (-not $HasStaticIP) {
+    Write-Host "`nNo static IP found. Please enter static IP details."
+    $IPAddress    = Read-Host "Enter static IP address (e.g., 192.168.1.10)"
+    $PrefixLength = Read-Host "Enter prefix length (e.g., 24 for /24)"
+    $Gateway      = Read-Host "Enter default gateway (e.g., 192.168.1.1)"
+    $DNSServer    = Read-Host "Enter DNS server (use same as this DC, e.g., $IPAddress)"
+
+    try {
+        # Remove existing IPv4 addresses
+        Get-NetIPAddress -InterfaceIndex $NIC.ifIndex -AddressFamily IPv4 | Remove-NetIPAddress -Confirm:$false -ErrorAction SilentlyContinue
+
+        # Assign static IP
+        New-NetIPAddress -InterfaceIndex $NIC.ifIndex -IPAddress $IPAddress -PrefixLength $PrefixLength -DefaultGateway $Gateway -ErrorAction Stop
+
+        # Set DNS
+        Set-DnsClientServerAddress -InterfaceIndex $NIC.ifIndex -ServerAddresses $DNSServer -ErrorAction Stop
+
+        Write-Host "Static IP and DNS configured."
+    }
+    catch {
+        Write-Error "Failed to configure network settings: $_"
+    }
+} else {
+    Write-Host "Static IP already exists. Skipping IP configuration."
 }
 
 # ----------------------------
-# Promote to Domain Controller
+# Prepare for reboot if rename occurred
 # ----------------------------
-try {
-    Install-ADDSForest `
-        -DomainName $DomainName `
-        -CreateDnsDelegation:$false `
-        -DatabasePath "C:\Windows\NTDS" `
-        -DomainMode "WinThreshold" `
-        -ForestMode "WinThreshold" `
-        -InstallDns:$true `
-        -LogPath "C:\Windows\NTDS" `
-        -SysvolPath "C:\Windows\SYSVOL" `
-        -SafeModeAdministratorPassword $SafeModePass `
-        -Force -ErrorAction Stop
+if ($RenameRebootRequired) {
+    try {
+        if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory -Path "C:\Temp" | Out-Null }
+        New-Item -ItemType File -Path $MarkerPath -Force | Out-Null
 
-    Write-Host "`nDomain Controller promotion initiated successfully."
+        Write-Host "`nRebooting server to apply computer rename and continue DC promotion..."
+        Start-Sleep -Seconds 5
+        Restart-Computer
+    }
+    catch {
+        Write-Error "Failed to reboot server: $_"
+        Write-Host "`nPress any key to exit..."
+        $null = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+        exit
+    }
+} else {
+    # If rename not needed, proceed to install AD DS and promote DC immediately
+    try {
+        # Install AD DS if not already installed
+        if (-not (Get-WindowsFeature AD-Domain-Services).Installed) {
+            Write-Host "Installing AD DS role..."
+            Install-WindowsFeature AD-Domain-Services -IncludeManagementTools -ErrorAction Stop
+        }
+
+        Write-Host "Promoting server to Domain Controller..."
+        Install-ADDSForest `
+            -DomainName $DomainName `
+            -CreateDnsDelegation:$false `
+            -DatabasePath "C:\Windows\NTDS" `
+            -DomainMode "WinThreshold" `
+            -ForestMode "WinThreshold" `
+            -InstallDns:$true `
+            -LogPath "C:\Windows\NTDS" `
+            -SysvolPath "C:\Windows\SYSVOL" `
+            -SafeModeAdministratorPassword $SafeModePass `
+            -Force -ErrorAction Stop
+
+        Write-Host "`nDomain Controller promotion completed successfully!"
+    }
+    catch {
+        Write-Error "Error during DC promotion: $_"
+    }
+
+    Write-Host "`nPress any key to exit..."
+    $null = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    exit
 }
-catch {
-    Write-Error "Failed to promote server to Domain Controller: $_"
-}
-
-# ----------------------------
-# End of Script
-# ----------------------------
-Write-Host "`nSetup script finished. Review any errors above before rebooting."
-
-# Pause before exiting so you can read the output
-Write-Host "`nPress any key to exit..."
-$x = $host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
