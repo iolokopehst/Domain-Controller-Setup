@@ -4,11 +4,11 @@ Automates installing Active Directory Domain Services (AD DS) and promoting
 the server to a Domain Controller for a new forest.
 
 .DESCRIPTION
-- Checks for admin rights and self-elevates if needed.
+- Self-elevates if not run as admin.
 - Installs AD DS role if missing.
-- Ensures Administrator account has a non-blank password.
-- Promotes server to a Domain Controller in a new forest.
-- Handles errors gracefully and pauses at the end so messages are visible.
+- Always prompts for Administrator password if not a DC.
+- Promotes server to Domain Controller in a new forest.
+- Handles errors gracefully, logs all actions, and pauses at the end.
 #>
 
 # ----------------------------
@@ -23,9 +23,32 @@ if (-not ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdent
 Write-Host "`n=== Active Directory Domain Controller Setup ===`n"
 
 # ----------------------------
-# Install AD DS role if not present
+# Logging
 # ----------------------------
+$LogDir = "C:\Setup-DC"
+$LogFile = "$LogDir\setup-dc.log"
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+Start-Transcript -Path $LogFile -Force
+
 try {
+    # ----------------------------
+    # Check if already a Domain Controller
+    # ----------------------------
+    try {
+        $DCCheck = Get-ADDomain -ErrorAction SilentlyContinue
+        if ($DCCheck) {
+            Write-Host "This server is already a Domain Controller in domain $($DCCheck.DNSRoot). Exiting."
+            Stop-Transcript
+            Read-Host "Press Enter to exit"
+            exit 0
+        }
+    } catch {
+        # Not a DC yet, continue
+    }
+
+    # ----------------------------
+    # Install AD DS role if missing
+    # ----------------------------
     $ADDS = Get-WindowsFeature AD-Domain-Services
     if (-not $ADDS.Installed) {
         Write-Host "Installing Active Directory Domain Services role..."
@@ -34,80 +57,43 @@ try {
     } else {
         Write-Host "AD DS role already installed. Skipping installation.`n"
     }
-} catch {
-    Write-Error "Failed to install AD DS role: $_"
-    Read-Host "Press Enter to exit"
-    exit 1
-}
 
-# ----------------------------
-# Check if already a Domain Controller
-# ----------------------------
-try {
-    $DC = Get-ADDomain -ErrorAction SilentlyContinue
-    if ($DC) {
-        Write-Host "This server is already a Domain Controller in domain $($DC.DNSRoot). Exiting."
-        Read-Host "Press Enter to exit"
-        exit 0
-    }
-} catch {
-    # Not a DC yet, continue
-}
-
-# ----------------------------
-# Ensure Administrator has a usable password
-# ----------------------------
-$AdminUser = "Administrator"
-$HasBlankPassword = $false
-
-# Test authentication with blank password
-$TestPassword = ConvertTo-SecureString "" -AsPlainText -Force
-$Cred = New-Object System.Management.Automation.PSCredential($AdminUser, $TestPassword)
-try {
-    $null = Start-Process powershell.exe -Credential $Cred -ArgumentList "-Command exit" -ErrorAction Stop
-    $HasBlankPassword = $true
-} catch {
-    $HasBlankPassword = $false
-}
-
-if ($HasBlankPassword) {
-    Write-Warning "Administrator account currently has a BLANK password. This must be changed before promotion."
-    $NewPassword = Read-Host "Enter a new password for Administrator" -AsSecureString
+    # ----------------------------
+    # Prompt to set Administrator password (required for AD promotion)
+    # ----------------------------
+    Write-Host "You must set a secure password for the local Administrator account before promotion."
+    $AdminPassword = Read-Host "Enter a new password for Administrator" -AsSecureString
     try {
-        Set-LocalUser -Name $AdminUser -Password $NewPassword -ErrorAction Stop
+        Set-LocalUser -Name "Administrator" -Password $AdminPassword -ErrorAction Stop
         Write-Host "Administrator password updated successfully.`n"
     } catch {
         Write-Error "Failed to set Administrator password: $_"
         Read-Host "Press Enter to exit"
         exit 1
     }
-}
 
-# ----------------------------
-# Prompt for domain details
-# ----------------------------
-$DomainName = Read-Host "Enter the new domain name (e.g., corp.local)"
-$SafeModePass = Read-Host "Enter Directory Services Restore Mode (DSRM) password" -AsSecureString
+    # ----------------------------
+    # Prompt for domain details
+    # ----------------------------
+    $DomainName = Read-Host "Enter the new domain name (e.g., corp.local)"
+    $DSRMPassword = Read-Host "Enter Directory Services Restore Mode (DSRM) password" -AsSecureString
 
-# ----------------------------
-# Promote server to DC
-# ----------------------------
-try {
+    # ----------------------------
+    # Promote server to Domain Controller
+    # ----------------------------
     Write-Host "Promoting server to Domain Controller for domain $DomainName..."
     Install-ADDSForest `
         -DomainName $DomainName `
-        -SafeModeAdministratorPassword $SafeModePass `
+        -SafeModeAdministratorPassword $DSRMPassword `
         -InstallDNS:$true `
         -Force:$true -ErrorAction Stop
 
     Write-Host "`nDomain Controller promotion started. The server will reboot automatically."
-} catch {
-    Write-Error "Failed to promote server to Domain Controller: $_"
-    Read-Host "Press Enter to exit"
-    exit 1
-}
 
-# ----------------------------
-# Keep window open at the end
-# ----------------------------
-Read-Host "`nSetup completed. Press Enter to close this window"
+} catch {
+    Write-Error "A fatal error occurred: $_"
+} finally {
+    Stop-Transcript
+    Write-Host "`nScript finished. Review log at: $LogFile"
+    Read-Host "Press Enter to exit"
+}
